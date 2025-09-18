@@ -1,6 +1,7 @@
 import torch
 import triton
 import triton.language as tl
+import math
 
 
 # x: [B, H, N, d]  -> out: [B, H, N, d(d+1)/2]
@@ -12,7 +13,8 @@ def kron_kernel(x_ptr, out_ptr,
                     B, H, N,
                     d: tl.constexpr,
                     num_terms: tl.constexpr,
-                    BLOCK_M: tl.constexpr):
+                    BLOCK_M: tl.constexpr,
+                    DTYPE: tl.constexpr):
     # program ids
     pid   = tl.program_id(0)                          # 0 .. num_terms-1  (upper-triangular term id)
     bid_n = tl.program_id(1)                          # tile along N (sequence) dimension
@@ -53,10 +55,10 @@ def kron_kernel(x_ptr, out_ptr,
     xj = tl.load(x_ptr + base_x + j, mask=mask_n, other=0.0)
 
     # 1 coefficient if indices equal, √2 coefficient otherwise
-    coef = tl.where(j == i, 1.0, tl.full((), 1.4142135623730951, dtype=tl.float32))  # √2 (fp32)
+    coef = tl.where(j == i, 1.0, tl.full((), 1.4142135623730951, dtype=DTYPE))  # √2 (fp32)
     val  = coef * xi * xj
 
-    tl.store(out_ptr + base_out + pid, val, mask=mask_n)
+    tl.store(out_ptr + base_out + pid, val.to(DTYPE), mask=mask_n)
 
 
 
@@ -67,15 +69,26 @@ def kron(x: torch.Tensor, block_m: int = 64):
     out: [B, H, N, d(d+1)//2]
     Ensures that for each (b,h,n):  dot(phi(x), phi(y)) == (x·y)^2
     """
+    x = x.contiguous()
     assert x.ndim == 4, "x must be [B, H, N, d]"
     B, H, N, d = x.shape
     num_terms = d * (d + 1) // 2
     out = torch.empty((B, H, N, num_terms), device=x.device, dtype=x.dtype)
+    
+    DTYPE = out.dtype
+    if DTYPE == torch.float16:
+        DTYPE = tl.float16
+    elif DTYPE == torch.bfloat16:
+        DTYPE = tl.bfloat16
+    elif DTYPE == torch.float32:
+        DTYPE = tl.float32
+    else:
+        assert False
 
     grid = (num_terms, triton.cdiv(N, block_m), B * H)
     kron_kernel[grid](
         x, out, B, H, N,
-        d=d, num_terms=num_terms, BLOCK_M=block_m
+        d=d, num_terms=num_terms, BLOCK_M=block_m, DTYPE=DTYPE
     )
     return out
 
@@ -91,9 +104,9 @@ if __name__ == "__main__":
     M = 256
     d = 64
     DEVICE = triton.runtime.driver.active.get_active_torch_device()
-    x = torch.rand(B, H, N, d, device=DEVICE)
-    y = torch.rand(B, H, M, d, device=DEVICE)
-    BLOCK_M = min(N, 64)
+    x = torch.randn(B, H, N, d, device=DEVICE).float()
+    y = torch.randn(B, H, M, d, device=DEVICE).float()
+    BLOCK_M = min(2**(math.ceil(math.log2(N))), 64)
     output_triton = kron(x, BLOCK_M) @ kron(y, BLOCK_M).mT
     output_torch = (x @ y.mT)**2
     print(output_torch)
